@@ -35,7 +35,13 @@ import htsjdk.samtools.util.Log;
 import picard.filter.CountingFilter;
 import picard.filter.CountingPairedFilter;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.LongStream;
 
 /**
@@ -44,6 +50,7 @@ import java.util.stream.LongStream;
  * @author Mariia_Zueva@epam.com, EPAM Systems, Inc. <www.epam.com>
  */
 public class WgsMetricsProcessorImpl<T extends AbstractRecordAndOffset> implements WgsMetricsProcessor {
+    private static final int BATCH_SIZE = 1000;
     /**
      * Source of input data
      */
@@ -70,9 +77,9 @@ public class WgsMetricsProcessorImpl<T extends AbstractRecordAndOffset> implemen
      * @param progress  logger
      */
     public WgsMetricsProcessorImpl(AbstractLocusIterator<T, AbstractLocusInfo<T>> iterator,
-            ReferenceSequenceFileWalker refWalker,
-            AbstractWgsMetricsCollector<T> collector,
-            ProgressLogger progress) {
+                                   ReferenceSequenceFileWalker refWalker,
+                                   AbstractWgsMetricsCollector<T> collector,
+                                   ProgressLogger progress) {
         this.iterator = iterator;
         this.collector = collector;
         this.refWalker = refWalker;
@@ -84,22 +91,28 @@ public class WgsMetricsProcessorImpl<T extends AbstractRecordAndOffset> implemen
      */
     @Override
     public void processFile() {
-        long counter = 0;
+        AtomicLong counter = new AtomicLong(0L);
+
+        List<AbstractLocusInfo<T>> batch = new ArrayList<>(BATCH_SIZE);
+
+        ExecutorService service = Executors.newSingleThreadExecutor();
+
+        Semaphore sem = new Semaphore(1);
 
         while (iterator.hasNext()) {
             final AbstractLocusInfo<T> info = iterator.next();
-            final ReferenceSequence ref = refWalker.get(info.getSequenceIndex());
-            boolean referenceBaseN = collector.isReferenceBaseN(info.getPosition(), ref);
-            collector.addInfo(info, ref, referenceBaseN);
-            if (referenceBaseN) {
-                continue;
+            batch.add(info);
+
+            if (batch.size() == BATCH_SIZE) {
+                submitInfos(batch, service, counter, sem);
+                batch = new ArrayList<>(BATCH_SIZE);
             }
 
-            progress.record(info.getSequenceName(), info.getPosition());
-            if (collector.isTimeToStop(++counter)) {
-                break;
-            }
-            collector.setCounter(counter);
+        }
+
+        if (!batch.isEmpty()){
+            submitInfos(batch, service, counter, sem);
+            batch = new ArrayList<>(BATCH_SIZE);
         }
         // check that we added the same number of bases to the raw coverage histogram and the base quality histograms
         final long sumBaseQ = Arrays.stream(collector.unfilteredBaseQHistogramArray).sum();
@@ -109,13 +122,35 @@ public class WgsMetricsProcessorImpl<T extends AbstractRecordAndOffset> implemen
         }
     }
 
+    private void submitInfos(List<AbstractLocusInfo<T>> batch, ExecutorService service, AtomicLong counter, Semaphore sem) {
+        List<AbstractLocusInfo<T>> infos = batch;
+        service.submit(() -> {
+            for (AbstractLocusInfo<T> absInfo : infos) {
+                final ReferenceSequence ref = refWalker.get(absInfo.getSequenceIndex());
+                boolean referenceBaseN = collector.isReferenceBaseN(absInfo.getPosition(), ref);
+                collector.addInfo(absInfo, ref, referenceBaseN);
+                if (referenceBaseN) {
+                    continue;
+                }
+
+                progress.record(absInfo.getSequenceName(), absInfo.getPosition());
+                if (collector.isTimeToStop(counter.incrementAndGet())) {
+                    break;
+                }
+                collector.setCounter(counter.get());
+
+            }
+            sem.release();
+        });
+    }
+
     @Override
     public void addToMetricsFile(MetricsFile<WgsMetrics, Integer> file,
-            boolean includeBQHistogram,
-            CountingFilter dupeFilter,
-            CountingFilter adapterFilter,
-            CountingFilter mapqFilter,
-            CountingPairedFilter pairFilter) {
+                                 boolean includeBQHistogram,
+                                 CountingFilter dupeFilter,
+                                 CountingFilter adapterFilter,
+                                 CountingFilter mapqFilter,
+                                 CountingPairedFilter pairFilter) {
         collector.addToMetricsFile(file, includeBQHistogram, dupeFilter, adapterFilter, mapqFilter, pairFilter);
     }
 }

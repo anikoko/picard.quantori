@@ -45,8 +45,14 @@ import picard.cmdline.argumentcollections.RequiredOutputArgumentCollection;
 import picard.util.SequenceDictionaryUtils;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -56,6 +62,7 @@ import java.util.Collection;
  * @author Tim Fennell
  */
 public abstract class SinglePassSamProgram extends CommandLineProgram {
+    private static final int BATCH_SIZE = 1000;
     @Argument(shortName = StandardOptionDefinitions.INPUT_SHORT_NAME, doc = "Input SAM/BAM/CRAM file.")
     public File INPUT;
 
@@ -149,17 +156,32 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         final ProgressLogger progress = new ProgressLogger(log);
 
+        List<SAMRecord> recBatch = new ArrayList<>(BATCH_SIZE);
+        List<ReferenceSequence> refBatch = new ArrayList<>(BATCH_SIZE);
+
+
+        ExecutorService service = Executors.newSingleThreadExecutor();
+
+        Semaphore sem = new Semaphore(2);
+
+        ReferenceSequence ref = null;
         for (final SAMRecord rec : in) {
-            final ReferenceSequence ref;
             if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 ref = null;
             } else {
                 ref = walker.get(rec.getReferenceIndex());
             }
 
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
+            recBatch.add(rec);
+            refBatch.add(ref);
+
+            if (recBatch.size() == BATCH_SIZE){
+                sem.acquireUninterruptibly();
+                submitRecords(programs, recBatch, refBatch, service, sem);
+                recBatch = new ArrayList<>(BATCH_SIZE);
+                refBatch = new ArrayList<>(BATCH_SIZE);
             }
+
 
             progress.record(rec);
 
@@ -174,11 +196,32 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             }
         }
 
+        if (!recBatch.isEmpty()){
+            submitRecords(programs, recBatch, refBatch, service, sem);
+        }
+
         CloserUtil.close(in);
 
         for (final SinglePassSamProgram program : programs) {
             program.finish();
         }
+    }
+
+    private static void submitRecords(Collection<SinglePassSamProgram> programs,
+                                      List<SAMRecord> recBatch,
+                                      List<ReferenceSequence> refBatch,
+                                      ExecutorService service,
+                                      Semaphore sem) {
+        List<SAMRecord> records = recBatch;
+        service.submit(() -> {
+            for (int i = 0; i < recBatch.size(); i++) {
+                for (final SinglePassSamProgram program : programs) {
+                    program.acceptRead(recBatch.get(i), refBatch.get(i));
+                }
+            }
+            sem.release();
+
+        });
     }
 
     /** Can be overridden and set to false if the section of unmapped reads at the end of the file isn't needed. */
